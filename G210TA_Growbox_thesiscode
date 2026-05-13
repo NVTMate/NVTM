@@ -1,0 +1,861 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
+#include <Wire.h>
+#include <DHT.h>
+#include <BH1750.h>
+#include <FastLED.h>
+#include <ESP32Servo.h>
+#include <U8g2lib.h>
+// WIFI SETTINGS
+#define WIFI_SSID     "YOUR_WIFI_NAME"
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+// FIREBASE REALTIME DATABASE SETTINGS
+#define FIREBASE_DATABASE_URL "https://YOUR_PROJECT_ID-default-rtdb.europe-west1.firebasedatabase.app"
+#define FIREBASE_AUTH_TOKEN ""
+#define DEVICE_ID "box001"
+// PIN SETTINGS
+#define DHT_PIN        4
+#define DHT_TYPE       DHT22
+#define I2C_SDA        21
+#define I2C_SCL        22
+#define SOIL_ADC_PIN   34
+#define BUTTON_PIN     33   // button to GND
+#define SERVO_PIN      25   // MG90S servo
+#define PUMP_PIN       26   // MOSFET gate for pump
+#define LED_PIN        27   // WS2812B data pin
+// LCD KC-12864-BB ST7920 via U8g2 SW SPI
+U8G2_ST7920_128X64_F_SW_SPI u8g2(
+  U8G2_R0,
+  /* clock=*/ 18,
+  /* data=*/  23,
+  /* cs=*/    5,
+  /* reset=*/ 32
+);
+// LED SETTINGS
+#define NUM_LEDS 59
+CRGB leds[NUM_LEDS];
+// SENSOR OBJECTS
+DHT dht(DHT_PIN, DHT_TYPE);
+BH1750 lightMeter;
+Servo ventServo;
+// FLASH STORAGE OBJECT
+Preferences prefs;
+// COMBINED TOMATO + SWEET PEPPER GROWTH CYCLE
+struct GrowthStage {
+  const char* name;
+  int durationDays;
+  float tempMin;
+  float tempMax;
+  int lightHours;
+  int humidityMin;
+  int humidityMax;
+  int waterMinMlDay;
+  int waterMaxMlDay;
+};
+
+GrowthStage combinedStages[] = {
+  {"Germination",  10,  24, 26, 0,  80, 90, 50, 50},
+  {"Seedling",     25,  20, 25, 14, 60, 70, 50, 100},
+  {"Vegetation",   40,  25, 28, 16, 60, 70, 150, 500},
+  {"Flowering",    18,  24, 26, 14, 60, 70, 300, 800},
+  {"Fruiting",     25,  24, 26, 14, 60, 70, 300, 1000}
+};
+
+const int STAGE_COUNT = 5;
+// CONFIG VALUES EDITABLE FROM FIREBASE
+struct GrowConfig {
+  bool automationEnabled = true;
+  int startDay = 0;
+  int forceStage = -1;          // -1 = automatic, 0-4 = forced stage
+
+  // SoilCap V2.0 calibration:
+  // dry / air:        2928
+  // barely damp soil: 1599
+  // very wet soil:     930
+  int soilDryValue = 2928;
+  int soilWetValue = 930;
+  // With this calibration:
+  // 2928 = 0%
+  // 1599 = ~66%
+  // 930  = 100%
+  int soilMinPercent = 45;      // pump starts below this
+  int soilOkPercent = 70;       // reference/display target
+  float pumpMlPerSecond = 20.0;
+  unsigned long pumpStartupMs = 2500;
+  unsigned long pumpWateringMs = 700;
+  unsigned long pumpCooldownMs = 30000;
+  int lightStartHour = 6;
+  int ledBrightness = 80;
+  int servoClosed = 120;
+  int servoOpen = 30;
+  bool autoLights = true;
+  bool autoPump = true;
+  bool autoVent = true;
+};
+GrowConfig cfg;
+// GLOBAL VARIABLES
+uint64_t lastSensorRead = 0;
+uint64_t lastPumpRun = 0;
+uint64_t lastFirebaseRead = 0;
+uint64_t lastFirebaseUpload = 0;
+uint64_t lastLcdUpdate = 0;
+uint64_t lastRuntimeSave = 0;
+uint64_t savedRuntimeMs = 0;
+uint64_t bootTimeMs = 0;
+const uint64_t SENSOR_INTERVAL_MS = 5000;
+const uint64_t FIREBASE_READ_INTERVAL_MS = 15000;
+const uint64_t FIREBASE_UPLOAD_INTERVAL_MS = 15000;
+const uint64_t LCD_UPDATE_INTERVAL_MS = 1000;
+const uint64_t RUNTIME_SAVE_INTERVAL_MS = 60000;
+// Real use:
+const uint64_t DAY_LENGTH_MS = 24ULL * 60ULL * 60ULL * 1000ULL;
+// Fast testing:
+// const uint64_t DAY_LENGTH_MS = 60000ULL;
+float temperature = 0;
+float humidity = 0;
+float lux = 0;
+int soilRaw = 0;
+int soilPercent = 0;
+float waterUsedTodayMl = 0;
+int previousDay = -1;
+bool lcdEnabled = true;
+int lcdPage = 0;
+const int LCD_PAGE_COUNT = 4;
+bool lastButtonState = HIGH;
+uint64_t buttonPressStart = 0;
+bool longPressHandled = false;
+// TIME HELPER
+uint64_t nowMs() {
+  return esp_timer_get_time() / 1000ULL;
+}
+// TOTAL MACHINE RUNTIME
+uint64_t getTotalRuntimeMs() {
+  return savedRuntimeMs + (nowMs() - bootTimeMs);
+}
+
+void saveRuntimeToFlash() {
+  uint64_t totalRuntime = getTotalRuntimeMs();
+  prefs.putULong64("runtimeMs", totalRuntime);
+  Serial.print("Runtime saved: ");
+  Serial.print(totalRuntime / 1000);
+  Serial.println(" seconds");
+}
+
+void resetRuntime() {
+  savedRuntimeMs = 0;
+  bootTimeMs = nowMs();
+  prefs.putULong64("runtimeMs", 0);
+  waterUsedTodayMl = 0;
+  previousDay = -1;
+  Serial.println("Runtime reset to 0.");
+}
+// FIREBASE URL HELPER
+String firebaseUrl(String path) {
+  String url = String(FIREBASE_DATABASE_URL) + path + ".json";
+
+  if (String(FIREBASE_AUTH_TOKEN).length() > 0) {
+    url += "?auth=";
+    url += FIREBASE_AUTH_TOKEN;
+  }
+
+  return url;
+}
+// CURRENT GROW DAY AND HOUR
+int getCurrentGrowDay() {
+  return cfg.startDay + (getTotalRuntimeMs() / DAY_LENGTH_MS);
+}
+
+int getCurrentHour() {
+  uint64_t timeToday = getTotalRuntimeMs() % DAY_LENGTH_MS;
+  return (timeToday * 24ULL) / DAY_LENGTH_MS;
+}
+// CURRENT GROWTH STAGE
+GrowthStage getCurrentStage() {
+  if (cfg.forceStage >= 0 && cfg.forceStage < STAGE_COUNT) {
+    return combinedStages[cfg.forceStage];
+  }
+
+  int day = getCurrentGrowDay();
+  int accumulatedDays = 0;
+
+  for (int i = 0; i < STAGE_COUNT; i++) {
+    accumulatedDays += combinedStages[i].durationDays;
+
+    if (day < accumulatedDays) {
+      return combinedStages[i];
+    }
+  }
+
+  return combinedStages[STAGE_COUNT - 1];
+}
+// SOIL MOISTURE
+// Read multiple samples and average them.
+// This makes the SoilCap value much more stable.
+int readSoilRawAverage() {
+  const int samples = 15;
+  long total = 0;
+
+  for (int i = 0; i < samples; i++) {
+    total += analogRead(SOIL_ADC_PIN);
+    delay(5);
+  }
+
+  return total / samples;
+}
+
+int readSoilPercent() {
+  int raw = readSoilRawAverage();
+  soilRaw = raw;
+  int percent = map(raw, cfg.soilDryValue, cfg.soilWetValue, 0, 100);
+  percent = constrain(percent, 0, 100);
+  return percent;
+}
+
+const char* getSoilStatus() {
+  if (soilPercent < cfg.soilMinPercent) {
+    return "DRY";
+  } else if (soilPercent < cfg.soilOkPercent) {
+    return "DAMP";
+  } else {
+    return "WET";
+  }
+}
+// LED CONTROL
+void setGrowLights(bool on) {
+  FastLED.setBrightness(cfg.ledBrightness);
+
+  if (on) {
+    for (int i = 0; i < NUM_LEDS; i++) {
+      leds[i] = CRGB(180, 0, 120);
+    }
+  } else {
+    for (int i = 0; i < NUM_LEDS; i++) {
+      leds[i] = CRGB::Black;
+    }
+  }
+
+  FastLED.show();
+}
+
+void controlLights(GrowthStage stage) {
+  if (!cfg.autoLights) return;
+
+  int hour = getCurrentHour();
+
+  if (stage.lightHours <= 0) {
+    setGrowLights(false);
+    return;
+  }
+
+  int lightEndHour = cfg.lightStartHour + stage.lightHours;
+  bool lightShouldBeOn = false;
+
+  if (lightEndHour <= 24) {
+    lightShouldBeOn = (hour >= cfg.lightStartHour && hour < lightEndHour);
+  } else {
+    int wrappedEnd = lightEndHour - 24;
+    lightShouldBeOn = (hour >= cfg.lightStartHour || hour < wrappedEnd);
+  }
+
+  setGrowLights(lightShouldBeOn);
+}
+// SERVO VENTILATION
+void controlVentilation(GrowthStage stage) {
+  if (!cfg.autoVent) return;
+
+  bool tooHot = temperature > stage.tempMax;
+  bool tooHumid = humidity > stage.humidityMax;
+
+  if (tooHot || tooHumid) {
+    ventServo.write(cfg.servoOpen);
+  } else {
+    ventServo.write(cfg.servoClosed);
+  }
+}
+// PUMP CONTROL WITH STARTUP / PRIMING DELAY
+void runPumpPulse() {
+  Serial.println("Pump starting / priming...");
+  digitalWrite(PUMP_PIN, HIGH);
+  delay(cfg.pumpStartupMs);
+  Serial.println("Pump should now be delivering water...");
+  delay(cfg.pumpWateringMs);
+  digitalWrite(PUMP_PIN, LOW);
+  lastPumpRun = nowMs();
+  float pumpedMl = (cfg.pumpWateringMs / 1000.0) * cfg.pumpMlPerSecond;
+  waterUsedTodayMl += pumpedMl;
+  Serial.print("Pump startup time: ");
+  Serial.print(cfg.pumpStartupMs);
+  Serial.println(" ms");
+  Serial.print("Actual watering time: ");
+  Serial.print(cfg.pumpWateringMs);
+  Serial.println(" ms");
+  Serial.print("Estimated water added: ");
+  Serial.print(pumpedMl);
+  Serial.println(" ml");
+}
+
+void controlWatering(GrowthStage stage) {
+  if (!cfg.autoPump) return;
+  uint64_t now = nowMs();
+  int currentDay = getCurrentGrowDay();
+  if (currentDay != previousDay) {
+    previousDay = currentDay;
+    waterUsedTodayMl = 0;
+  }
+
+  bool soilTooDry = soilPercent < cfg.soilMinPercent;
+  bool cooldownPassed = (now - lastPumpRun) > cfg.pumpCooldownMs;
+  bool dailyLimitNotReached = waterUsedTodayMl < stage.waterMaxMlDay;
+  if (soilTooDry && cooldownPassed && dailyLimitNotReached) {
+    runPumpPulse();
+  }
+}
+// SENSOR READING
+void readSensors() {
+  float newTemp = dht.readTemperature();
+  float newHum = dht.readHumidity();
+
+  if (!isnan(newTemp)) {
+    temperature = newTemp;
+  } else {
+    Serial.println("DHT temperature read failed.");
+  }
+
+  if (!isnan(newHum)) {
+    humidity = newHum;
+  } else {
+    Serial.println("DHT humidity read failed.");
+  }
+
+  lux = lightMeter.readLightLevel();
+  soilPercent = readSoilPercent();
+}
+// BUTTON CONTROL
+// Short press: change LCD page
+// Long press: LCD on/off
+void handleButton() {
+  bool buttonState = digitalRead(BUTTON_PIN);
+  uint64_t now = nowMs();
+
+  if (lastButtonState == HIGH && buttonState == LOW) {
+    buttonPressStart = now;
+    longPressHandled = false;
+  }
+
+  if (buttonState == LOW && !longPressHandled) {
+    if (now - buttonPressStart > 800) {
+      lcdEnabled = !lcdEnabled;
+      longPressHandled = true;
+
+      if (!lcdEnabled) {
+        u8g2.clearBuffer();
+        u8g2.sendBuffer();
+      }
+    }
+  }
+
+  if (lastButtonState == LOW && buttonState == HIGH) {
+    if (!longPressHandled) {
+      lcdPage++;
+      if (lcdPage >= LCD_PAGE_COUNT) {
+        lcdPage = 0;
+      }
+    }
+  }
+
+  lastButtonState = buttonState;
+}
+// LCD DISPLAY
+void drawLcd(GrowthStage stage) {
+  if (!lcdEnabled) return;
+
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+
+  char line[32];
+
+  if (lcdPage == 0) {
+    u8g2.drawStr(0, 10, "Grow Box 1/4");
+
+    snprintf(line, sizeof(line), "Day: %d Hour: %d", getCurrentGrowDay(), getCurrentHour());
+    u8g2.drawStr(0, 24, line);
+
+    snprintf(line, sizeof(line), "Stage: %s", stage.name);
+    u8g2.drawStr(0, 36, line);
+
+    snprintf(line, sizeof(line), "Tomato + Pepper");
+    u8g2.drawStr(0, 50, line);
+  }
+
+  else if (lcdPage == 1) {
+    u8g2.drawStr(0, 10, "Climate 2/4");
+
+    snprintf(line, sizeof(line), "Temp: %.1f C", temperature);
+    u8g2.drawStr(0, 24, line);
+
+    snprintf(line, sizeof(line), "Hum: %.1f %%", humidity);
+    u8g2.drawStr(0, 36, line);
+
+    snprintf(line, sizeof(line), "Target: %.0f-%.0fC", stage.tempMin, stage.tempMax);
+    u8g2.drawStr(0, 50, line);
+  }
+
+  else if (lcdPage == 2) {
+    u8g2.drawStr(0, 10, "Soil/Light 3/4");
+
+    snprintf(line, sizeof(line), "Soil: %d %% %s", soilPercent, getSoilStatus());
+    u8g2.drawStr(0, 24, line);
+
+    snprintf(line, sizeof(line), "Raw: %d", soilRaw);
+    u8g2.drawStr(0, 36, line);
+
+    snprintf(line, sizeof(line), "Lux: %.0f", lux);
+    u8g2.drawStr(0, 50, line);
+  }
+
+  else if (lcdPage == 3) {
+    u8g2.drawStr(0, 10, "System 4/4");
+
+    snprintf(line, sizeof(line), "Auto: %s", cfg.automationEnabled ? "ON" : "OFF");
+    u8g2.drawStr(0, 24, line);
+
+    snprintf(line, sizeof(line), "Run: %.1f h", getTotalRuntimeMs() / 3600000.0);
+    u8g2.drawStr(0, 36, line);
+
+    snprintf(line, sizeof(line), "WiFi: %s", WiFi.status() == WL_CONNECTED ? "OK" : "NO");
+    u8g2.drawStr(0, 50, line);
+  }
+
+  u8g2.sendBuffer();
+}
+// FIREBASE: READ CONFIG
+void readFirebaseConfig() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  String path = "/growboxes/" + String(DEVICE_ID) + "/config";
+  String url = firebaseUrl(path);
+
+  HTTPClient http;
+  http.begin(url);
+
+  int httpCode = http.GET();
+
+  if (httpCode == 200) {
+    String payload = http.getString();
+
+    if (payload != "null") {
+      StaticJsonDocument<2048> doc;
+      DeserializationError error = deserializeJson(doc, payload);
+
+      if (!error) {
+        if (doc["automationEnabled"].is<bool>()) cfg.automationEnabled = doc["automationEnabled"];
+        if (doc["startDay"].is<int>()) cfg.startDay = doc["startDay"];
+        if (doc["forceStage"].is<int>()) cfg.forceStage = doc["forceStage"];
+
+        if (doc["soilDryValue"].is<int>()) cfg.soilDryValue = doc["soilDryValue"];
+        if (doc["soilWetValue"].is<int>()) cfg.soilWetValue = doc["soilWetValue"];
+        if (doc["soilMinPercent"].is<int>()) cfg.soilMinPercent = doc["soilMinPercent"];
+        if (doc["soilOkPercent"].is<int>()) cfg.soilOkPercent = doc["soilOkPercent"];
+
+        if (doc["pumpMlPerSecond"].is<float>()) cfg.pumpMlPerSecond = doc["pumpMlPerSecond"];
+
+        if (doc["pumpStartupMs"].is<int>()) cfg.pumpStartupMs = doc["pumpStartupMs"];
+        if (doc["pumpWateringMs"].is<int>()) cfg.pumpWateringMs = doc["pumpWateringMs"];
+        if (doc["pumpCooldownMs"].is<int>()) cfg.pumpCooldownMs = doc["pumpCooldownMs"];
+
+        if (doc["lightStartHour"].is<int>()) cfg.lightStartHour = doc["lightStartHour"];
+        if (doc["ledBrightness"].is<int>()) cfg.ledBrightness = constrain((int)doc["ledBrightness"], 0, 255);
+
+        if (doc["servoClosed"].is<int>()) cfg.servoClosed = constrain((int)doc["servoClosed"], 0, 180);
+        if (doc["servoOpen"].is<int>()) cfg.servoOpen = constrain((int)doc["servoOpen"], 0, 180);
+
+        if (doc["autoLights"].is<bool>()) cfg.autoLights = doc["autoLights"];
+        if (doc["autoPump"].is<bool>()) cfg.autoPump = doc["autoPump"];
+        if (doc["autoVent"].is<bool>()) cfg.autoVent = doc["autoVent"];
+
+        Serial.println("Firebase config updated.");
+      } else {
+        Serial.println("Firebase JSON parse failed.");
+      }
+    }
+  } else {
+    Serial.print("Firebase config read HTTP error: ");
+    Serial.println(httpCode);
+  }
+
+  http.end();
+}
+// FIREBASE: UPLOAD DEFAULT CONFIG
+void uploadDefaultConfig() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  String path = "/growboxes/" + String(DEVICE_ID) + "/config";
+  String url = firebaseUrl(path);
+
+  StaticJsonDocument<2048> doc;
+
+  doc["automationEnabled"] = cfg.automationEnabled;
+  doc["startDay"] = cfg.startDay;
+  doc["forceStage"] = cfg.forceStage;
+
+  doc["soilDryValue"] = cfg.soilDryValue;
+  doc["soilWetValue"] = cfg.soilWetValue;
+  doc["soilMinPercent"] = cfg.soilMinPercent;
+  doc["soilOkPercent"] = cfg.soilOkPercent;
+
+  doc["pumpMlPerSecond"] = cfg.pumpMlPerSecond;
+  doc["pumpStartupMs"] = cfg.pumpStartupMs;
+  doc["pumpWateringMs"] = cfg.pumpWateringMs;
+  doc["pumpCooldownMs"] = cfg.pumpCooldownMs;
+
+  doc["lightStartHour"] = cfg.lightStartHour;
+  doc["ledBrightness"] = cfg.ledBrightness;
+
+  doc["servoClosed"] = cfg.servoClosed;
+  doc["servoOpen"] = cfg.servoOpen;
+
+  doc["autoLights"] = cfg.autoLights;
+  doc["autoPump"] = cfg.autoPump;
+  doc["autoVent"] = cfg.autoVent;
+
+  String json;
+  serializeJson(doc, json);
+
+  HTTPClient http;
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+
+  int httpCode = http.PUT(json);
+
+  Serial.print("Default config upload HTTP code: ");
+  Serial.println(httpCode);
+
+  http.end();
+}
+// FIREBASE: RESET COMMANDS
+void resetFirebaseCommands() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  String path = "/growboxes/" + String(DEVICE_ID) + "/commands";
+  String url = firebaseUrl(path);
+
+  StaticJsonDocument<256> doc;
+  doc["manualPump"] = false;
+  doc["openVent"] = false;
+  doc["closeVent"] = false;
+  doc["lightsOn"] = false;
+  doc["lightsOff"] = false;
+  doc["resetRuntime"] = false;
+
+  String json;
+  serializeJson(doc, json);
+
+  HTTPClient http;
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.PUT(json);
+  http.end();
+}
+// FIREBASE: READ COMMANDS
+void readFirebaseCommands() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  String path = "/growboxes/" + String(DEVICE_ID) + "/commands";
+  String url = firebaseUrl(path);
+
+  HTTPClient http;
+  http.begin(url);
+
+  int httpCode = http.GET();
+
+  if (httpCode == 200) {
+    String payload = http.getString();
+
+    if (payload != "null") {
+      StaticJsonDocument<512> doc;
+      DeserializationError error = deserializeJson(doc, payload);
+
+      if (!error) {
+        bool manualPump = doc["manualPump"] | false;
+        bool openVent = doc["openVent"] | false;
+        bool closeVent = doc["closeVent"] | false;
+        bool lightsOn = doc["lightsOn"] | false;
+        bool lightsOff = doc["lightsOff"] | false;
+        bool resetRuntimeCommand = doc["resetRuntime"] | false;
+
+        if (manualPump) runPumpPulse();
+        if (openVent) ventServo.write(cfg.servoOpen);
+        if (closeVent) ventServo.write(cfg.servoClosed);
+        if (lightsOn) setGrowLights(true);
+        if (lightsOff) setGrowLights(false);
+        if (resetRuntimeCommand) resetRuntime();
+
+        if (manualPump || openVent || closeVent || lightsOn || lightsOff || resetRuntimeCommand) {
+          resetFirebaseCommands();
+        }
+      }
+    }
+  }
+
+  http.end();
+}
+// FIREBASE: UPLOAD STATUS
+void uploadStatusToFirebase(GrowthStage stage) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  String path = "/growboxes/" + String(DEVICE_ID) + "/status";
+  String url = firebaseUrl(path);
+
+  StaticJsonDocument<2048> doc;
+
+  doc["deviceId"] = DEVICE_ID;
+  doc["online"] = true;
+
+  doc["plants"] = "Tomato + Sweet Pepper";
+  doc["growDay"] = getCurrentGrowDay();
+  doc["currentHour"] = getCurrentHour();
+  doc["stage"] = stage.name;
+
+  doc["runtimeMs"] = getTotalRuntimeMs();
+  doc["runtimeSeconds"] = getTotalRuntimeMs() / 1000;
+  doc["runtimeHours"] = getTotalRuntimeMs() / 3600000.0;
+
+  doc["temperature"] = temperature;
+  doc["humidity"] = humidity;
+  doc["lux"] = lux;
+
+  doc["soilRaw"] = soilRaw;
+  doc["soilPercent"] = soilPercent;
+  doc["soilStatus"] = getSoilStatus();
+
+  doc["soilCalibration"]["dryValue"] = cfg.soilDryValue;
+  doc["soilCalibration"]["wetValue"] = cfg.soilWetValue;
+  doc["soilCalibration"]["minPercent"] = cfg.soilMinPercent;
+  doc["soilCalibration"]["okPercent"] = cfg.soilOkPercent;
+
+  doc["waterUsedTodayMl"] = waterUsedTodayMl;
+
+  doc["target"]["tempMin"] = stage.tempMin;
+  doc["target"]["tempMax"] = stage.tempMax;
+  doc["target"]["humidityMin"] = stage.humidityMin;
+  doc["target"]["humidityMax"] = stage.humidityMax;
+  doc["target"]["lightHours"] = stage.lightHours;
+  doc["target"]["waterMinMlDay"] = stage.waterMinMlDay;
+  doc["target"]["waterMaxMlDay"] = stage.waterMaxMlDay;
+
+  doc["pump"]["startupMs"] = cfg.pumpStartupMs;
+  doc["pump"]["wateringMs"] = cfg.pumpWateringMs;
+  doc["pump"]["cooldownMs"] = cfg.pumpCooldownMs;
+  doc["pump"]["mlPerSecond"] = cfg.pumpMlPerSecond;
+
+  String json;
+  serializeJson(doc, json);
+
+  HTTPClient http;
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+
+  int httpCode = http.PUT(json);
+
+  Serial.print("Status upload HTTP code: ");
+  Serial.println(httpCode);
+
+  http.end();
+}
+// SERIAL STATUS
+void printStatus(GrowthStage stage) {
+  Serial.println();
+  Serial.println("==================================");
+  Serial.println("Plants: Tomato + Sweet Pepper");
+
+  Serial.print("Runtime seconds: ");
+  Serial.println(getTotalRuntimeMs() / 1000);
+
+  Serial.print("Runtime hours: ");
+  Serial.println(getTotalRuntimeMs() / 3600000.0);
+
+  Serial.print("Day: ");
+  Serial.println(getCurrentGrowDay());
+
+  Serial.print("Hour: ");
+  Serial.println(getCurrentHour());
+
+  Serial.print("Stage: ");
+  Serial.println(stage.name);
+
+  Serial.print("Temperature: ");
+  Serial.print(temperature);
+  Serial.println(" C");
+
+  Serial.print("Humidity: ");
+  Serial.print(humidity);
+  Serial.println(" %");
+
+  Serial.print("Lux: ");
+  Serial.println(lux);
+
+  Serial.print("Soil raw: ");
+  Serial.println(soilRaw);
+
+  Serial.print("Soil moisture: ");
+  Serial.print(soilPercent);
+  Serial.println(" %");
+
+  Serial.print("Soil status: ");
+  Serial.println(getSoilStatus());
+
+  Serial.print("Soil dry calibration: ");
+  Serial.println(cfg.soilDryValue);
+
+  Serial.print("Soil wet calibration: ");
+  Serial.println(cfg.soilWetValue);
+
+  Serial.print("Water used today: ");
+  Serial.print(waterUsedTodayMl);
+  Serial.println(" ml");
+
+  Serial.print("Pump startup: ");
+  Serial.print(cfg.pumpStartupMs);
+  Serial.println(" ms");
+
+  Serial.print("Pump watering: ");
+  Serial.print(cfg.pumpWateringMs);
+  Serial.println(" ms");
+
+  Serial.print("WiFi: ");
+  Serial.println(WiFi.status() == WL_CONNECTED ? "connected" : "not connected");
+
+  Serial.println("==================================");
+}
+// WIFI SETUP
+void connectWiFi() {
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.print("Connecting to WiFi");
+
+  int attempts = 0;
+
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+    Serial.print(".");
+    delay(500);
+    attempts++;
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi connected. IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WiFi connection failed. Running offline.");
+  }
+}
+// SETUP
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("Starting Tomato + Sweet Pepper Grow Box...");
+
+  prefs.begin("growbox", false);
+  savedRuntimeMs = prefs.getULong64("runtimeMs", 0);
+  bootTimeMs = nowMs();
+
+  Serial.print("Loaded saved runtime: ");
+  Serial.print(savedRuntimeMs / 1000);
+  Serial.println(" seconds");
+
+  pinMode(PUMP_PIN, OUTPUT);
+  digitalWrite(PUMP_PIN, LOW);
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  dht.begin();
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  if (lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE)) {
+    Serial.println("BH1750 started.");
+  } else {
+    Serial.println("BH1750 error. Check SDA/SCL wiring.");
+  }
+
+  u8g2.begin();
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(0, 12, "Grow Box Starting...");
+  u8g2.drawStr(0, 28, "Runtime loaded");
+  u8g2.sendBuffer();
+
+  FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
+  FastLED.setBrightness(cfg.ledBrightness);
+  setGrowLights(false);
+
+  ventServo.setPeriodHertz(50);
+  ventServo.attach(SERVO_PIN, 500, 2400);
+  ventServo.write(cfg.servoClosed);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(SOIL_ADC_PIN, ADC_11db);
+
+  connectWiFi();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    uploadDefaultConfig();
+    resetFirebaseCommands();
+    readFirebaseConfig();
+  }
+
+  Serial.println("System ready.");
+}
+// LOOP
+void loop() {
+  uint64_t now = nowMs();
+
+  handleButton();
+
+  GrowthStage currentStage = getCurrentStage();
+
+  if (now - lastSensorRead >= SENSOR_INTERVAL_MS) {
+    lastSensorRead = now;
+
+    readSensors();
+
+    if (cfg.automationEnabled) {
+      controlLights(currentStage);
+      controlVentilation(currentStage);
+      controlWatering(currentStage);
+    }
+
+    printStatus(currentStage);
+  }
+
+  if (now - lastFirebaseRead >= FIREBASE_READ_INTERVAL_MS) {
+    lastFirebaseRead = now;
+
+    if (WiFi.status() == WL_CONNECTED) {
+      readFirebaseConfig();
+      readFirebaseCommands();
+    }
+  }
+
+  if (now - lastFirebaseUpload >= FIREBASE_UPLOAD_INTERVAL_MS) {
+    lastFirebaseUpload = now;
+
+    if (WiFi.status() == WL_CONNECTED) {
+      uploadStatusToFirebase(currentStage);
+    }
+  }
+
+  if (now - lastLcdUpdate >= LCD_UPDATE_INTERVAL_MS) {
+    lastLcdUpdate = now;
+    drawLcd(currentStage);
+  }
+
+  if (now - lastRuntimeSave >= RUNTIME_SAVE_INTERVAL_MS) {
+    lastRuntimeSave = now;
+    saveRuntimeToFlash();
+  }
+}
