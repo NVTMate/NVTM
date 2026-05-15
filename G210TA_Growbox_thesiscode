@@ -2,33 +2,30 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+
 #include <Wire.h>
 #include <DHT.h>
 #include <BH1750.h>
 #include <FastLED.h>
 #include <ESP32Servo.h>
 #include <U8g2lib.h>
-
 // WIFI SETTINGS
-#define WIFI_SSID     "YOUR_WIFI_NAME"
-#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
-
+#define WIFI_SSID     "WIFI_NAME"
+#define WIFI_PASSWORD "WIFI_PASSWORD"
 // FIREBASE REALTIME DATABASE SETTINGS
 #define FIREBASE_DATABASE_URL "https://YOUR_PROJECT_ID-default-rtdb.europe-west1.firebasedatabase.app"
 #define FIREBASE_AUTH_TOKEN ""
 #define DEVICE_ID "box001"
-
 // PIN SETTINGS
 #define DHT_PIN        4
 #define DHT_TYPE       DHT22
 #define I2C_SDA        21
 #define I2C_SCL        22
 #define SOIL_ADC_PIN   34
-#define BUTTON_PIN     33
-#define SERVO_PIN      25
-#define PUMP_PIN       26
-#define LED_PIN        27
-
+#define BUTTON_PIN     33   // button to GND
+#define SERVO_PIN      25   // MG90S servo
+#define PUMP_PIN       26   // MOSFET gate for pump
+#define LED_PIN        27   // WS2812B data pin
 // LCD KC-12864-BB ST7920 via U8g2 SW SPI
 U8G2_ST7920_128X64_F_SW_SPI u8g2(
   U8G2_R0,
@@ -37,20 +34,16 @@ U8G2_ST7920_128X64_F_SW_SPI u8g2(
   /* cs=*/    5,
   /* reset=*/ 32
 );
-
 // LED SETTINGS
 #define NUM_LEDS 59
 CRGB leds[NUM_LEDS];
-
 // SENSOR OBJECTS
 DHT dht(DHT_PIN, DHT_TYPE);
 BH1750 lightMeter;
 Servo ventServo;
-
 // FLASH STORAGE OBJECT
 Preferences prefs;
-
-// GROWTH STAGE STRUCTURE
+// COMBINED TOMATO + SWEET PEPPER GROWTH CYCLE
 struct GrowthStage {
   const char* name;
   int durationDays;
@@ -63,65 +56,38 @@ struct GrowthStage {
   int waterMaxMlDay;
 };
 
-// PLANT MODE
-enum PlantMode {
-  PLANT_TOMATO = 0,
-  PLANT_PAPRIKA = 1
+GrowthStage combinedStages[] = {
+  {"Germination",  10,  24, 26, 0,  80, 90, 50, 50},
+  {"Seedling",     25,  20, 25, 14, 60, 70, 50, 100},
+  {"Vegetation",   40,  25, 28, 16, 60, 70, 150, 500},
+  {"Flowering",    18,  24, 26, 14, 60, 70, 300, 800},
+  {"Fruiting",     25,  24, 26, 14, 60, 70, 300, 1000}
 };
-
-PlantMode plantMode = PLANT_TOMATO;
-PlantMode selectedPlantMode = PLANT_TOMATO;
-bool plantSelectMode = false;
 
 const int STAGE_COUNT = 5;
-
-// TOMATO GROWTH CYCLE
-GrowthStage tomatoStages[] = {
-  {"Germination", 10, 21, 24, 0,  80, 90, 50, 50},
-  {"Seedling",    25, 20, 25, 14, 60, 70, 50, 100},
-  {"Vegetation",  30, 20, 28, 16, 60, 70, 250, 500},
-  {"Flowering",   18, 21, 24, 14, 60, 70, 500, 800},
-  {"Fruiting",    25, 20, 25, 14, 60, 70, 500, 1000}
-};
-
-// PAPRIKA / SWEET PEPPER GROWTH CYCLE
-GrowthStage paprikaStages[] = {
-  {"Germination", 14, 25, 30, 0,  80, 90, 50, 50},
-  {"Seedling",    25, 20, 25, 14, 60, 70, 50, 100},
-  {"Vegetation",  40, 25, 30, 16, 60, 70, 150, 300},
-  {"Flowering",   18, 25, 30, 14, 60, 70, 300, 600},
-  {"Fruiting",    25, 25, 30, 14, 60, 70, 300, 800}
-};
-
-GrowthStage* getActiveStages() {
-  if (plantMode == PLANT_PAPRIKA) {
-    return paprikaStages;
-  }
-  return tomatoStages;
-}
-
-const char* getPlantModeName(PlantMode mode) {
-  if (mode == PLANT_PAPRIKA) {
-    return "Paprika";
-  }
-  return "Tomato";
-}
-
-// CONFIG VALUES
+// CONFIG VALUES EDITABLE FROM FIREBASE
 struct GrowConfig {
-  uint32_t configVersion = 0;
-
   bool automationEnabled = true;
-  int startDay = 0;
-  int forceStage = -1;
 
+  int startDay = 0;
+  int forceStage = -1;          // -1 = automatic, 0-4 = forced stage
+
+  // SoilCap V2.0 calibration from YOUR measurements:
+  // dry / air:        2928
+  // barely damp soil: 1599
+  // very wet soil:     930
   int soilDryValue = 2928;
   int soilWetValue = 930;
 
-  int soilMinPercent = 45;
-  int soilOkPercent = 70;
+  // With this calibration:
+  // 2928 = 0%
+  // 1599 = ~66%
+  // 930  = 100%
+  int soilMinPercent = 45;      // pump starts below this
+  int soilOkPercent = 70;       // reference/display target
 
   float pumpMlPerSecond = 20.0;
+
   unsigned long pumpStartupMs = 2500;
   unsigned long pumpWateringMs = 700;
   unsigned long pumpCooldownMs = 30000;
@@ -138,7 +104,6 @@ struct GrowConfig {
 };
 
 GrowConfig cfg;
-
 // GLOBAL VARIABLES
 uint64_t lastSensorRead = 0;
 uint64_t lastPumpRun = 0;
@@ -146,18 +111,19 @@ uint64_t lastFirebaseRead = 0;
 uint64_t lastFirebaseUpload = 0;
 uint64_t lastLcdUpdate = 0;
 uint64_t lastRuntimeSave = 0;
-
 uint64_t savedRuntimeMs = 0;
 uint64_t bootTimeMs = 0;
-
 const uint64_t SENSOR_INTERVAL_MS = 5000;
 const uint64_t FIREBASE_READ_INTERVAL_MS = 15000;
 const uint64_t FIREBASE_UPLOAD_INTERVAL_MS = 15000;
 const uint64_t LCD_UPDATE_INTERVAL_MS = 1000;
 const uint64_t RUNTIME_SAVE_INTERVAL_MS = 60000;
 
+// Real use:
 const uint64_t DAY_LENGTH_MS = 24ULL * 60ULL * 60ULL * 1000ULL;
-// const uint64_t DAY_LENGTH_MS = 60000ULL; // fast testing
+
+// Fast testing:
+// const uint64_t DAY_LENGTH_MS = 60000ULL;
 
 float temperature = 0;
 float humidity = 0;
@@ -176,15 +142,10 @@ const int LCD_PAGE_COUNT = 4;
 bool lastButtonState = HIGH;
 uint64_t buttonPressStart = 0;
 bool longPressHandled = false;
-
-const uint64_t BUTTON_LONG_MIN_MS = 800;
-const uint64_t BUTTON_VERY_LONG_MS = 5000;
-
 // TIME HELPER
 uint64_t nowMs() {
   return esp_timer_get_time() / 1000ULL;
 }
-
 // TOTAL MACHINE RUNTIME
 uint64_t getTotalRuntimeMs() {
   return savedRuntimeMs + (nowMs() - bootTimeMs);
@@ -192,6 +153,7 @@ uint64_t getTotalRuntimeMs() {
 
 void saveRuntimeToFlash() {
   uint64_t totalRuntime = getTotalRuntimeMs();
+
   prefs.putULong64("runtimeMs", totalRuntime);
 
   Serial.print("Runtime saved: ");
@@ -209,85 +171,6 @@ void resetRuntime() {
 
   Serial.println("Runtime reset to 0.");
 }
-
-// LOCAL CONFIG STORAGE
-void saveLocalConfigToFlash() {
-  prefs.putUInt("cfgVer", cfg.configVersion);
-
-  prefs.putBool("autEn", cfg.automationEnabled);
-  prefs.putInt("startDay", cfg.startDay);
-  prefs.putInt("forceSt", cfg.forceStage);
-
-  prefs.putInt("plantMode", (int)plantMode);
-
-  prefs.putInt("soilDry", cfg.soilDryValue);
-  prefs.putInt("soilWet", cfg.soilWetValue);
-  prefs.putInt("soilMin", cfg.soilMinPercent);
-  prefs.putInt("soilOk", cfg.soilOkPercent);
-
-  prefs.putFloat("pumpMl", cfg.pumpMlPerSecond);
-  prefs.putULong("pStart", cfg.pumpStartupMs);
-  prefs.putULong("pWater", cfg.pumpWateringMs);
-  prefs.putULong("pCool", cfg.pumpCooldownMs);
-
-  prefs.putInt("lightStart", cfg.lightStartHour);
-  prefs.putInt("ledBright", cfg.ledBrightness);
-
-  prefs.putInt("servoClos", cfg.servoClosed);
-  prefs.putInt("servoOpen", cfg.servoOpen);
-
-  prefs.putBool("aLights", cfg.autoLights);
-  prefs.putBool("aPump", cfg.autoPump);
-  prefs.putBool("aVent", cfg.autoVent);
-
-  Serial.print("Local config saved. Version: ");
-  Serial.println(cfg.configVersion);
-}
-
-void loadLocalConfigFromFlash() {
-  cfg.configVersion = prefs.getUInt("cfgVer", cfg.configVersion);
-
-  cfg.automationEnabled = prefs.getBool("autEn", cfg.automationEnabled);
-  cfg.startDay = prefs.getInt("startDay", cfg.startDay);
-  cfg.forceStage = prefs.getInt("forceSt", cfg.forceStage);
-
-  int savedPlantMode = prefs.getInt("plantMode", PLANT_TOMATO);
-
-  if (savedPlantMode == PLANT_PAPRIKA) {
-    plantMode = PLANT_PAPRIKA;
-  } else {
-    plantMode = PLANT_TOMATO;
-  }
-
-  selectedPlantMode = plantMode;
-
-  cfg.soilDryValue = prefs.getInt("soilDry", cfg.soilDryValue);
-  cfg.soilWetValue = prefs.getInt("soilWet", cfg.soilWetValue);
-  cfg.soilMinPercent = prefs.getInt("soilMin", cfg.soilMinPercent);
-  cfg.soilOkPercent = prefs.getInt("soilOk", cfg.soilOkPercent);
-
-  cfg.pumpMlPerSecond = prefs.getFloat("pumpMl", cfg.pumpMlPerSecond);
-  cfg.pumpStartupMs = prefs.getULong("pStart", cfg.pumpStartupMs);
-  cfg.pumpWateringMs = prefs.getULong("pWater", cfg.pumpWateringMs);
-  cfg.pumpCooldownMs = prefs.getULong("pCool", cfg.pumpCooldownMs);
-
-  cfg.lightStartHour = prefs.getInt("lightStart", cfg.lightStartHour);
-  cfg.ledBrightness = prefs.getInt("ledBright", cfg.ledBrightness);
-
-  cfg.servoClosed = prefs.getInt("servoClos", cfg.servoClosed);
-  cfg.servoOpen = prefs.getInt("servoOpen", cfg.servoOpen);
-
-  cfg.autoLights = prefs.getBool("aLights", cfg.autoLights);
-  cfg.autoPump = prefs.getBool("aPump", cfg.autoPump);
-  cfg.autoVent = prefs.getBool("aVent", cfg.autoVent);
-
-  Serial.print("Loaded local config version: ");
-  Serial.println(cfg.configVersion);
-
-  Serial.print("Loaded plant mode: ");
-  Serial.println(getPlantModeName(plantMode));
-}
-
 // FIREBASE URL HELPER
 String firebaseUrl(String path) {
   String url = String(FIREBASE_DATABASE_URL) + path + ".json";
@@ -299,61 +182,6 @@ String firebaseUrl(String path) {
 
   return url;
 }
-
-// FIREBASE: UPLOAD LOCAL CONFIG
-void uploadLocalConfigToFirebase() {
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  String path = "/growboxes/" + String(DEVICE_ID) + "/config";
-  String url = firebaseUrl(path);
-
-  StaticJsonDocument<2048> doc;
-
-  doc["configVersion"] = cfg.configVersion;
-
-  doc["automationEnabled"] = cfg.automationEnabled;
-  doc["startDay"] = cfg.startDay;
-  doc["forceStage"] = cfg.forceStage;
-
-  doc["plantMode"] = (int)plantMode;
-  doc["plantModeName"] = getPlantModeName(plantMode);
-
-  doc["soilDryValue"] = cfg.soilDryValue;
-  doc["soilWetValue"] = cfg.soilWetValue;
-  doc["soilMinPercent"] = cfg.soilMinPercent;
-  doc["soilOkPercent"] = cfg.soilOkPercent;
-
-  doc["pumpMlPerSecond"] = cfg.pumpMlPerSecond;
-  doc["pumpStartupMs"] = cfg.pumpStartupMs;
-  doc["pumpWateringMs"] = cfg.pumpWateringMs;
-  doc["pumpCooldownMs"] = cfg.pumpCooldownMs;
-
-  doc["lightStartHour"] = cfg.lightStartHour;
-  doc["ledBrightness"] = cfg.ledBrightness;
-
-  doc["servoClosed"] = cfg.servoClosed;
-  doc["servoOpen"] = cfg.servoOpen;
-
-  doc["autoLights"] = cfg.autoLights;
-  doc["autoPump"] = cfg.autoPump;
-  doc["autoVent"] = cfg.autoVent;
-
-  String json;
-  json.reserve(1024);
-  serializeJson(doc, json);
-
-  HTTPClient http;
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-
-  int httpCode = http.PUT(json);
-
-  Serial.print("Local config upload HTTP code: ");
-  Serial.println(httpCode);
-
-  http.end();
-}
-
 // CURRENT GROW DAY AND HOUR
 int getCurrentGrowDay() {
   return cfg.startDay + (getTotalRuntimeMs() / DAY_LENGTH_MS);
@@ -363,29 +191,25 @@ int getCurrentHour() {
   uint64_t timeToday = getTotalRuntimeMs() % DAY_LENGTH_MS;
   return (timeToday * 24ULL) / DAY_LENGTH_MS;
 }
-
 // CURRENT GROWTH STAGE
 GrowthStage getCurrentStage() {
-  GrowthStage* stages = getActiveStages();
-
   if (cfg.forceStage >= 0 && cfg.forceStage < STAGE_COUNT) {
-    return stages[cfg.forceStage];
+    return combinedStages[cfg.forceStage];
   }
 
   int day = getCurrentGrowDay();
   int accumulatedDays = 0;
 
   for (int i = 0; i < STAGE_COUNT; i++) {
-    accumulatedDays += stages[i].durationDays;
+    accumulatedDays += combinedStages[i].durationDays;
 
     if (day < accumulatedDays) {
-      return stages[i];
+      return combinedStages[i];
     }
   }
 
-  return stages[STAGE_COUNT - 1];
+  return combinedStages[STAGE_COUNT - 1];
 }
-
 // SOIL MOISTURE
 int readSoilRawAverage() {
   const int samples = 15;
@@ -403,11 +227,6 @@ int readSoilPercent() {
   int raw = readSoilRawAverage();
   soilRaw = raw;
 
-  if (cfg.soilDryValue == cfg.soilWetValue) {
-    Serial.println("Soil calibration error: dry and wet values are equal.");
-    return soilPercent;
-  }
-
   int percent = map(raw, cfg.soilDryValue, cfg.soilWetValue, 0, 100);
   percent = constrain(percent, 0, 100);
 
@@ -423,7 +242,6 @@ const char* getSoilStatus() {
     return "WET";
   }
 }
-
 // LED CONTROL
 void setGrowLights(bool on) {
   FastLED.setBrightness(cfg.ledBrightness);
@@ -463,7 +281,6 @@ void controlLights(GrowthStage stage) {
 
   setGrowLights(lightShouldBeOn);
 }
-
 // SERVO VENTILATION
 void controlVentilation(GrowthStage stage) {
   if (!cfg.autoVent) return;
@@ -477,23 +294,32 @@ void controlVentilation(GrowthStage stage) {
     ventServo.write(cfg.servoClosed);
   }
 }
-
-// PUMP CONTROL
+// PUMP CONTROL WITH STARTUP / PRIMING DELAY
 void runPumpPulse() {
   Serial.println("Pump starting / priming...");
 
   digitalWrite(PUMP_PIN, HIGH);
+
   delay(cfg.pumpStartupMs);
 
   Serial.println("Pump should now be delivering water...");
 
   delay(cfg.pumpWateringMs);
+
   digitalWrite(PUMP_PIN, LOW);
 
   lastPumpRun = nowMs();
 
   float pumpedMl = (cfg.pumpWateringMs / 1000.0) * cfg.pumpMlPerSecond;
   waterUsedTodayMl += pumpedMl;
+
+  Serial.print("Pump startup time: ");
+  Serial.print(cfg.pumpStartupMs);
+  Serial.println(" ms");
+
+  Serial.print("Actual watering time: ");
+  Serial.print(cfg.pumpWateringMs);
+  Serial.println(" ms");
 
   Serial.print("Estimated water added: ");
   Serial.print(pumpedMl);
@@ -504,6 +330,7 @@ void controlWatering(GrowthStage stage) {
   if (!cfg.autoPump) return;
 
   uint64_t now = nowMs();
+
   int currentDay = getCurrentGrowDay();
 
   if (currentDay != previousDay) {
@@ -519,7 +346,6 @@ void controlWatering(GrowthStage stage) {
     runPumpPulse();
   }
 }
-
 // SENSOR READING
 void readSensors() {
   float newTemp = dht.readTemperature();
@@ -537,104 +363,9 @@ void readSensors() {
     Serial.println("DHT humidity read failed.");
   }
 
-  float newLux = lightMeter.readLightLevel();
-
-  if (newLux >= 0) {
-    lux = newLux;
-  } else {
-    Serial.println("BH1750 light read failed.");
-  }
-
+  lux = lightMeter.readLightLevel();
   soilPercent = readSoilPercent();
 }
-
-// LCD PLANT SELECTION SCREEN
-void drawPlantSelectScreen() {
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_6x10_tf);
-
-  char line[32];
-
-  u8g2.drawStr(0, 10, "Select grow mode");
-
-  snprintf(line, sizeof(line), "> %s", getPlantModeName(selectedPlantMode));
-  u8g2.drawStr(0, 26, line);
-
-  u8g2.drawStr(0, 40, "Short: switch");
-  u8g2.drawStr(0, 52, "Long: confirm");
-  u8g2.drawStr(0, 63, "0.8-4.9 sec");
-
-  u8g2.sendBuffer();
-}
-
-void enterPlantSelectMode() {
-  plantSelectMode = true;
-  selectedPlantMode = plantMode;
-  lcdEnabled = true;
-
-  drawPlantSelectScreen();
-
-  Serial.println("Plant selection mode started.");
-}
-
-void switchSelectedPlantMode() {
-  if (selectedPlantMode == PLANT_TOMATO) {
-    selectedPlantMode = PLANT_PAPRIKA;
-  } else {
-    selectedPlantMode = PLANT_TOMATO;
-  }
-
-  drawPlantSelectScreen();
-
-  Serial.print("Selected plant mode: ");
-  Serial.println(getPlantModeName(selectedPlantMode));
-}
-
-void confirmPlantMode() {
-  bool changed = (plantMode != selectedPlantMode);
-
-  plantMode = selectedPlantMode;
-  plantSelectMode = false;
-
-  if (changed) {
-    cfg.configVersion++;
-    waterUsedTodayMl = 0;
-    previousDay = -1;
-
-    saveLocalConfigToFlash();
-    uploadLocalConfigToFirebase();
-  }
-
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_6x10_tf);
-  u8g2.drawStr(0, 16, "Grow mode saved:");
-  u8g2.drawStr(0, 34, getPlantModeName(plantMode));
-  u8g2.drawStr(0, 52, "Returning...");
-  u8g2.sendBuffer();
-
-  Serial.print("Confirmed plant mode: ");
-  Serial.println(getPlantModeName(plantMode));
-
-  delay(1200);
-}
-
-void nextLcdPage() {
-  lcdPage++;
-
-  if (lcdPage >= LCD_PAGE_COUNT) {
-    lcdPage = 0;
-  }
-}
-
-void toggleLcdPower() {
-  lcdEnabled = !lcdEnabled;
-
-  if (!lcdEnabled) {
-    u8g2.clearBuffer();
-    u8g2.sendBuffer();
-  }
-}
-
 // BUTTON CONTROL
 void handleButton() {
   bool buttonState = digitalRead(BUTTON_PIN);
@@ -645,48 +376,32 @@ void handleButton() {
     longPressHandled = false;
   }
 
-  if (lastButtonState == LOW && buttonState == LOW && !longPressHandled) {
-    uint64_t pressDuration = now - buttonPressStart;
-
-    if (!plantSelectMode && pressDuration >= BUTTON_VERY_LONG_MS) {
-      enterPlantSelectMode();
+  if (buttonState == LOW && !longPressHandled) {
+    if (now - buttonPressStart > 800) {
+      lcdEnabled = !lcdEnabled;
       longPressHandled = true;
+
+      if (!lcdEnabled) {
+        u8g2.clearBuffer();
+        u8g2.sendBuffer();
+      }
     }
   }
 
   if (lastButtonState == LOW && buttonState == HIGH) {
-    uint64_t pressDuration = now - buttonPressStart;
-
     if (!longPressHandled) {
-      if (pressDuration < BUTTON_LONG_MIN_MS) {
-        if (plantSelectMode) {
-          switchSelectedPlantMode();
-        } else {
-          nextLcdPage();
-        }
-      }
-
-      else if (pressDuration >= BUTTON_LONG_MIN_MS && pressDuration < BUTTON_VERY_LONG_MS) {
-        if (plantSelectMode) {
-          confirmPlantMode();
-        } else {
-          toggleLcdPower();
-        }
+      lcdPage++;
+      if (lcdPage >= LCD_PAGE_COUNT) {
+        lcdPage = 0;
       }
     }
   }
 
   lastButtonState = buttonState;
 }
-
 // LCD DISPLAY
 void drawLcd(GrowthStage stage) {
   if (!lcdEnabled) return;
-
-  if (plantSelectMode) {
-    drawPlantSelectScreen();
-    return;
-  }
 
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x10_tf);
@@ -702,7 +417,7 @@ void drawLcd(GrowthStage stage) {
     snprintf(line, sizeof(line), "Stage: %s", stage.name);
     u8g2.drawStr(0, 36, line);
 
-    snprintf(line, sizeof(line), "Plant: %s", getPlantModeName(plantMode));
+    snprintf(line, sizeof(line), "Tomato + Pepper");
     u8g2.drawStr(0, 50, line);
   }
 
@@ -747,8 +462,7 @@ void drawLcd(GrowthStage stage) {
 
   u8g2.sendBuffer();
 }
-
-// FIREBASE: READ CONFIG WITH LOCAL PRIORITY
+// FIREBASE: READ CONFIG
 void readFirebaseConfig() {
   if (WiFi.status() != WL_CONNECTED) return;
 
@@ -763,124 +477,40 @@ void readFirebaseConfig() {
   if (httpCode == 200) {
     String payload = http.getString();
 
-    if (payload == "null") {
-      Serial.println("Firebase config is empty. Uploading local config.");
-      http.end();
-      uploadLocalConfigToFirebase();
-      return;
-    }
+    if (payload != "null") {
+      StaticJsonDocument<2048> doc;
+      DeserializationError error = deserializeJson(doc, payload);
 
-    StaticJsonDocument<2048> doc;
-    DeserializationError error = deserializeJson(doc, payload);
+      if (!error) {
+        if (doc["automationEnabled"].is<bool>()) cfg.automationEnabled = doc["automationEnabled"];
+        if (doc["startDay"].is<int>()) cfg.startDay = doc["startDay"];
+        if (doc["forceStage"].is<int>()) cfg.forceStage = doc["forceStage"];
 
-    if (!error) {
-      uint32_t firebaseVersion = doc["configVersion"] | 0;
+        if (doc["soilDryValue"].is<int>()) cfg.soilDryValue = doc["soilDryValue"];
+        if (doc["soilWetValue"].is<int>()) cfg.soilWetValue = doc["soilWetValue"];
+        if (doc["soilMinPercent"].is<int>()) cfg.soilMinPercent = doc["soilMinPercent"];
+        if (doc["soilOkPercent"].is<int>()) cfg.soilOkPercent = doc["soilOkPercent"];
 
-      Serial.print("Local config version: ");
-      Serial.println(cfg.configVersion);
+        if (doc["pumpMlPerSecond"].is<float>()) cfg.pumpMlPerSecond = doc["pumpMlPerSecond"];
 
-      Serial.print("Firebase config version: ");
-      Serial.println(firebaseVersion);
+        if (doc["pumpStartupMs"].is<int>()) cfg.pumpStartupMs = doc["pumpStartupMs"];
+        if (doc["pumpWateringMs"].is<int>()) cfg.pumpWateringMs = doc["pumpWateringMs"];
+        if (doc["pumpCooldownMs"].is<int>()) cfg.pumpCooldownMs = doc["pumpCooldownMs"];
 
-      if (firebaseVersion < cfg.configVersion) {
-        Serial.println("Local config is newer. Uploading local config to Firebase.");
-        http.end();
-        uploadLocalConfigToFirebase();
-        return;
+        if (doc["lightStartHour"].is<int>()) cfg.lightStartHour = doc["lightStartHour"];
+        if (doc["ledBrightness"].is<int>()) cfg.ledBrightness = constrain((int)doc["ledBrightness"], 0, 255);
+
+        if (doc["servoClosed"].is<int>()) cfg.servoClosed = constrain((int)doc["servoClosed"], 0, 180);
+        if (doc["servoOpen"].is<int>()) cfg.servoOpen = constrain((int)doc["servoOpen"], 0, 180);
+
+        if (doc["autoLights"].is<bool>()) cfg.autoLights = doc["autoLights"];
+        if (doc["autoPump"].is<bool>()) cfg.autoPump = doc["autoPump"];
+        if (doc["autoVent"].is<bool>()) cfg.autoVent = doc["autoVent"];
+
+        Serial.println("Firebase config updated.");
+      } else {
+        Serial.println("Firebase JSON parse failed.");
       }
-
-      if (firebaseVersion == cfg.configVersion) {
-        Serial.println("Config versions are equal. Keeping local config.");
-        http.end();
-        return;
-      }
-
-      Serial.println("Firebase config is newer. Applying Firebase config.");
-
-      cfg.configVersion = firebaseVersion;
-
-      if (doc["automationEnabled"].is<bool>()) cfg.automationEnabled = doc["automationEnabled"];
-      if (doc["startDay"].is<int>()) cfg.startDay = doc["startDay"];
-      if (doc["forceStage"].is<int>()) cfg.forceStage = doc["forceStage"];
-
-      if (doc["plantMode"].is<int>()) {
-        int firebasePlantMode = doc["plantMode"];
-
-        if (firebasePlantMode == PLANT_PAPRIKA) {
-          plantMode = PLANT_PAPRIKA;
-        } else {
-          plantMode = PLANT_TOMATO;
-        }
-
-        selectedPlantMode = plantMode;
-      }
-
-      if (doc["soilDryValue"].is<int>()) {
-        int v = doc["soilDryValue"];
-        if (v >= 0 && v <= 4095) cfg.soilDryValue = v;
-      }
-
-      if (doc["soilWetValue"].is<int>()) {
-        int v = doc["soilWetValue"];
-        if (v >= 0 && v <= 4095) cfg.soilWetValue = v;
-      }
-
-      if (doc["soilMinPercent"].is<int>()) {
-        int v = doc["soilMinPercent"];
-        if (v >= 0 && v <= 100) cfg.soilMinPercent = v;
-      }
-
-      if (doc["soilOkPercent"].is<int>()) {
-        int v = doc["soilOkPercent"];
-        if (v >= 0 && v <= 100) cfg.soilOkPercent = v;
-      }
-
-      if (!doc["pumpMlPerSecond"].isNull()) {
-        float v = doc["pumpMlPerSecond"].as<float>();
-        if (v > 0 && v <= 100) cfg.pumpMlPerSecond = v;
-      }
-
-      if (doc["pumpStartupMs"].is<long>()) {
-        long v = doc["pumpStartupMs"];
-        if (v >= 0 && v <= 10000) cfg.pumpStartupMs = v;
-      }
-
-      if (doc["pumpWateringMs"].is<long>()) {
-        long v = doc["pumpWateringMs"];
-        if (v >= 100 && v <= 10000) cfg.pumpWateringMs = v;
-      }
-
-      if (doc["pumpCooldownMs"].is<long>()) {
-        long v = doc["pumpCooldownMs"];
-        if (v >= 5000 && v <= 3600000) cfg.pumpCooldownMs = v;
-      }
-
-      if (doc["lightStartHour"].is<int>()) {
-        int v = doc["lightStartHour"];
-        if (v >= 0 && v <= 23) cfg.lightStartHour = v;
-      }
-
-      if (doc["ledBrightness"].is<int>()) {
-        cfg.ledBrightness = constrain((int)doc["ledBrightness"], 0, 255);
-      }
-
-      if (doc["servoClosed"].is<int>()) {
-        cfg.servoClosed = constrain((int)doc["servoClosed"], 0, 180);
-      }
-
-      if (doc["servoOpen"].is<int>()) {
-        cfg.servoOpen = constrain((int)doc["servoOpen"], 0, 180);
-      }
-
-      if (doc["autoLights"].is<bool>()) cfg.autoLights = doc["autoLights"];
-      if (doc["autoPump"].is<bool>()) cfg.autoPump = doc["autoPump"];
-      if (doc["autoVent"].is<bool>()) cfg.autoVent = doc["autoVent"];
-
-      saveLocalConfigToFlash();
-
-      Serial.println("Firebase config applied and saved locally.");
-    } else {
-      Serial.println("Firebase JSON parse failed.");
     }
   } else {
     Serial.print("Firebase config read HTTP error: ");
@@ -889,7 +519,53 @@ void readFirebaseConfig() {
 
   http.end();
 }
+// FIREBASE: UPLOAD DEFAULT CONFIG
+void uploadDefaultConfig() {
+  if (WiFi.status() != WL_CONNECTED) return;
 
+  String path = "/growboxes/" + String(DEVICE_ID) + "/config";
+  String url = firebaseUrl(path);
+
+  StaticJsonDocument<2048> doc;
+
+  doc["automationEnabled"] = cfg.automationEnabled;
+  doc["startDay"] = cfg.startDay;
+  doc["forceStage"] = cfg.forceStage;
+
+  doc["soilDryValue"] = cfg.soilDryValue;
+  doc["soilWetValue"] = cfg.soilWetValue;
+  doc["soilMinPercent"] = cfg.soilMinPercent;
+  doc["soilOkPercent"] = cfg.soilOkPercent;
+
+  doc["pumpMlPerSecond"] = cfg.pumpMlPerSecond;
+  doc["pumpStartupMs"] = cfg.pumpStartupMs;
+  doc["pumpWateringMs"] = cfg.pumpWateringMs;
+  doc["pumpCooldownMs"] = cfg.pumpCooldownMs;
+
+  doc["lightStartHour"] = cfg.lightStartHour;
+  doc["ledBrightness"] = cfg.ledBrightness;
+
+  doc["servoClosed"] = cfg.servoClosed;
+  doc["servoOpen"] = cfg.servoOpen;
+
+  doc["autoLights"] = cfg.autoLights;
+  doc["autoPump"] = cfg.autoPump;
+  doc["autoVent"] = cfg.autoVent;
+
+  String json;
+  serializeJson(doc, json);
+
+  HTTPClient http;
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+
+  int httpCode = http.PUT(json);
+
+  Serial.print("Default config upload HTTP code: ");
+  Serial.println(httpCode);
+
+  http.end();
+}
 // FIREBASE: RESET COMMANDS
 void resetFirebaseCommands() {
   if (WiFi.status() != WL_CONNECTED) return;
@@ -914,7 +590,6 @@ void resetFirebaseCommands() {
   http.PUT(json);
   http.end();
 }
-
 // FIREBASE: READ COMMANDS
 void readFirebaseCommands() {
   if (WiFi.status() != WL_CONNECTED) return;
@@ -971,10 +646,7 @@ void uploadStatusToFirebase(GrowthStage stage) {
   doc["deviceId"] = DEVICE_ID;
   doc["online"] = true;
 
-  doc["configVersion"] = cfg.configVersion;
-  doc["plantMode"] = (int)plantMode;
-  doc["plantModeName"] = getPlantModeName(plantMode);
-
+  doc["plants"] = "Tomato + Sweet Pepper";
   doc["growDay"] = getCurrentGrowDay();
   doc["currentHour"] = getCurrentHour();
   doc["stage"] = stage.name;
@@ -1012,7 +684,6 @@ void uploadStatusToFirebase(GrowthStage stage) {
   doc["pump"]["mlPerSecond"] = cfg.pumpMlPerSecond;
 
   String json;
-  json.reserve(1024);
   serializeJson(doc, json);
 
   HTTPClient http;
@@ -1026,17 +697,11 @@ void uploadStatusToFirebase(GrowthStage stage) {
 
   http.end();
 }
-
 // SERIAL STATUS
 void printStatus(GrowthStage stage) {
   Serial.println();
   Serial.println("==================================");
-
-  Serial.print("Config version: ");
-  Serial.println(cfg.configVersion);
-
-  Serial.print("Plant mode: ");
-  Serial.println(getPlantModeName(plantMode));
+  Serial.println("Plants: Tomato + Sweet Pepper");
 
   Serial.print("Runtime seconds: ");
   Serial.println(getTotalRuntimeMs() / 1000);
@@ -1074,16 +739,29 @@ void printStatus(GrowthStage stage) {
   Serial.print("Soil status: ");
   Serial.println(getSoilStatus());
 
+  Serial.print("Soil dry calibration: ");
+  Serial.println(cfg.soilDryValue);
+
+  Serial.print("Soil wet calibration: ");
+  Serial.println(cfg.soilWetValue);
+
   Serial.print("Water used today: ");
   Serial.print(waterUsedTodayMl);
   Serial.println(" ml");
+
+  Serial.print("Pump startup: ");
+  Serial.print(cfg.pumpStartupMs);
+  Serial.println(" ms");
+
+  Serial.print("Pump watering: ");
+  Serial.print(cfg.pumpWateringMs);
+  Serial.println(" ms");
 
   Serial.print("WiFi: ");
   Serial.println(WiFi.status() == WL_CONNECTED ? "connected" : "not connected");
 
   Serial.println("==================================");
 }
-
 // WIFI SETUP
 void connectWiFi() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -1107,20 +785,16 @@ void connectWiFi() {
     Serial.println("WiFi connection failed. Running offline.");
   }
 }
-
 // SETUP
 void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  Serial.println("Starting Grow Box...");
+  Serial.println("Starting Tomato + Sweet Pepper Grow Box...");
 
   prefs.begin("growbox", false);
-
   savedRuntimeMs = prefs.getULong64("runtimeMs", 0);
   bootTimeMs = nowMs();
-
-  loadLocalConfigFromFlash();
 
   Serial.print("Loaded saved runtime: ");
   Serial.print(savedRuntimeMs / 1000);
@@ -1145,8 +819,7 @@ void setup() {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x10_tf);
   u8g2.drawStr(0, 12, "Grow Box Starting...");
-  u8g2.drawStr(0, 28, getPlantModeName(plantMode));
-  u8g2.drawStr(0, 44, "Config loaded");
+  u8g2.drawStr(0, 28, "Runtime loaded");
   u8g2.sendBuffer();
 
   FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
@@ -1163,13 +836,13 @@ void setup() {
   connectWiFi();
 
   if (WiFi.status() == WL_CONNECTED) {
-    readFirebaseConfig();
+    uploadDefaultConfig();
     resetFirebaseCommands();
+    readFirebaseConfig();
   }
 
   Serial.println("System ready.");
 }
-
 // LOOP
 void loop() {
   uint64_t now = nowMs();
